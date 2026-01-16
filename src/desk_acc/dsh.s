@@ -1,7 +1,7 @@
 ;;; ============================================================
 ;;; DSH - Desk Accessory
 ;;;
-;;; Desktop Shell - A simple shell interface.
+;;; Desktop Shell - A simple shell interface with redraw support.
 ;;; ============================================================
 
         .include "../config.inc"
@@ -15,22 +15,6 @@
         .include "../desktop/desktop.inc"
 
 ;;; ============================================================
-;;; Memory map
-;;;
-;;;              Main           Aux
-;;;          :           : :           :
-;;;          |           | |           |
-;;;          | DHR       | | DHR       |
-;;;  $2000   +-----------+ +-----------+
-;;;          |           | |           |
-;;;          |           | |           |
-;;;          |           | |           |
-;;;          |           | | UI code & |
-;;;          |           | | resources |
-;;;   $800   +-----------+ +-----------+
-;;;          :           : :           :
-
-;;; ============================================================
 
         DA_HEADER
         DA_START_AUX_SEGMENT
@@ -39,8 +23,16 @@
 
         .include "../lib/event_params.s"
 
-.params trackgoaway_params      ; queried after close clicked to see if aborted/finished
-goaway:         .byte   0       ; 0 = aborted, 1 = clicked
+;;; ============================================================
+;;; Monaco monospaced font
+
+monaco_font:
+        .incbin .concat("../../out/Monaco.", kBuildLang, ".font")
+
+;;; ============================================================
+
+.params trackgoaway_params
+goaway:         .byte   0
 .endparams
 
 kDALeft    = 10
@@ -49,6 +41,10 @@ kDAWidth   = 512
 kDAHeight  = 150
 
 kDAWindowId = $80
+
+kLineHeight = 10
+kLeftMargin = 3
+kTopMargin = 10
 
 .params winfo
 window_id:      .byte   kDAWindowId
@@ -90,34 +86,89 @@ title_string:
 welcome_string:
         PASCAL_STRING "Welcome to dsh."
 
-.params welcome_pos
-xcoord: .word   10
-ycoord: .word   20
+prompt_string:
+        PASCAL_STRING "dsh% "
+
+.params cursor_pos
+xcoord: .word   kLeftMargin
+ycoord: .word   kTopMargin
 .endparams
+
+kInputBufferSize = 80
+input_buffer:   .res    kInputBufferSize, 0
+input_pos:      .byte   0
+
+;;; Simple redraw flag - just redraw welcome + prompt for now
+needs_redraw:   .byte   0
 
 .params welcome_params
 textptr:        .addr   welcome_string+1
 textlen:        .byte   .strlen("Welcome to dsh.")
 .endparams
 
+.params prompt_params
+textptr:        .addr   prompt_string+1
+textlen:        .byte   .strlen("dsh% ")
+.endparams
+
+char_buf:       .byte   0
+.params char_params
+textptr:        .addr   char_buf
+textlen:        .byte   1
+.endparams
+
+space_char:     .byte   ' '
+.params space_params
+textptr:        .addr   space_char
+textlen:        .byte   1
+.endparams
+
+;;; Cursor drawing params
+.params cursor_line
+xdelta: .word   0
+ydelta: .word   AS_WORD(-kLineHeight)
+.endparams
+
+.params penXOR
+penmode:        .byte   MGTK::pencopy|MGTK::notpencopy  ; XOR mode
+.endparams
+
+.params penCopy
+penmode:        .byte   MGTK::pencopy
+.endparams
+
 ;;; ============================================================
-;;; Create the DA window and display welcome message
 
 .proc Init
-        ;; Create window
         MGTK_CALL MGTK::OpenWindow, winfo
         MGTK_CALL MGTK::SetPort, winfo::port
 
-        ;; Draw welcome message
-        MGTK_CALL MGTK::MoveTo, welcome_pos
+        ;; Set monospaced font
+        MGTK_CALL MGTK::SetFont, monaco_font
+
+        ;; Draw welcome
+        copy16  #kLeftMargin, cursor_pos::xcoord
+        copy16  #kTopMargin, cursor_pos::ycoord
+        MGTK_CALL MGTK::MoveTo, cursor_pos
         MGTK_CALL MGTK::DrawText, welcome_params
 
+        ;; Draw prompt on next line
+        add16_8 cursor_pos::ycoord, #kLineHeight
+        copy16  #kLeftMargin, cursor_pos::xcoord
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, prompt_params
+
+        add16_8 cursor_pos::xcoord, #35
+        copy8   #0, input_pos
+
+        ;; Draw initial cursor
+        jsr     DrawCursor
+
         MGTK_CALL MGTK::FlushEvents
-        FALL_THROUGH_TO InputLoop
+        jmp     InputLoop
 .endproc ; Init
 
 ;;; ============================================================
-;;; Main Input Loop
 
 .proc InputLoop
         JSR_TO_MAIN JUMP_TABLE_SYSTEM_TASK
@@ -139,7 +190,6 @@ textlen:        .byte   .strlen("Welcome to dsh.")
         cmp     #kDAWindowId
         bne     InputLoop
 
-        ;; Which part of the window?
         lda     findwindow_params::which_area
         cmp     #MGTK::Area::close_box
         jeq     OnCloseClick
@@ -153,13 +203,11 @@ title:  jsr     OnTitleBarClick
 .endproc ; OnButtonDown
 
 ;;; ============================================================
-;;; Key handling
 
 .proc OnKeyDown
         ldx     event_params::modifiers
         beq     no_mod
 
-        ;; Modifiers
         lda     event_params::key
         jsr     ToUpperCase
 
@@ -168,18 +216,119 @@ title:  jsr     OnTitleBarClick
 
         jmp     InputLoop
 
-        ;; No modifiers
 no_mod:
         lda     event_params::key
 
         cmp     #CHAR_ESCAPE
         jeq     DoClose
 
+        cmp     #CHAR_RETURN
+        beq     HandleReturn
+
+        cmp     #CHAR_DELETE
+        beq     HandleBackspace
+
+        cmp     #CHAR_LEFT
+        beq     HandleBackspace
+
+        cmp     #' '
+        bcc     InputLoop
+        cmp     #$7F
+        bcs     InputLoop
+
+        jsr     HandleChar
+        jmp     InputLoop
+
+HandleReturn:
+        jsr     HandleEnter
+        jmp     InputLoop
+
+HandleBackspace:
+        jsr     HandleDelete
         jmp     InputLoop
 .endproc ; OnKeyDown
 
 ;;; ============================================================
-;;; Click on Close Button
+
+.proc HandleChar
+        lda     input_pos
+        cmp     #kInputBufferSize-1
+        bcs     done
+
+        ;; Erase cursor at current position
+        jsr     DrawCursor
+
+        tax
+        lda     event_params::key
+        sta     input_buffer,x
+        inc     input_pos
+
+        sta     char_buf
+
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, char_params
+
+        add16_8 cursor_pos::xcoord, #7
+
+        ;; Draw cursor at new position
+        jsr     DrawCursor
+
+done:   rts
+.endproc ; HandleChar
+
+;;; ============================================================
+
+.proc HandleEnter
+        ;; Erase cursor at current position
+        jsr     DrawCursor
+
+        add16_8 cursor_pos::ycoord, #kLineHeight
+        copy16  #kLeftMargin, cursor_pos::xcoord
+
+        lda     cursor_pos::ycoord+1
+        bne     reset
+        lda     cursor_pos::ycoord
+        cmp     #(kDAHeight - kLineHeight)
+        bcc     draw_prompt
+
+reset:  copy16  #kTopMargin, cursor_pos::ycoord
+
+draw_prompt:
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, prompt_params
+
+        add16_8 cursor_pos::xcoord, #35
+
+        copy8   #0, input_pos
+
+        ;; Draw cursor at new position
+        jsr     DrawCursor
+        rts
+.endproc ; HandleEnter
+
+;;; ============================================================
+
+.proc HandleDelete
+        lda     input_pos
+        beq     done
+
+        ;; Erase cursor at current position
+        jsr     DrawCursor
+
+        dec     input_pos
+
+        sub16_8 cursor_pos::xcoord, #7
+
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, space_params
+
+        ;; Draw cursor at new position
+        jsr     DrawCursor
+
+done:   rts
+.endproc ; HandleDelete
+
+;;; ============================================================
 
 .proc OnCloseClick
         MGTK_CALL MGTK::TrackGoAway, trackgoaway_params
@@ -195,7 +344,17 @@ no_mod:
 .endproc ; DoClose
 
 ;;; ============================================================
-;;; Click on Title Bar
+;;; Draw text cursor at current position
+
+.proc DrawCursor
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::SetPenMode, penXOR
+        MGTK_CALL MGTK::Line, cursor_line
+        MGTK_CALL MGTK::SetPenMode, penCopy
+        rts
+.endproc ; DrawCursor
+
+;;; ============================================================
 
 .proc OnTitleBarClick
         copy8   #kDAWindowId, dragwindow_params::window_id
@@ -203,6 +362,30 @@ no_mod:
         bit     dragwindow_params::moved
     IF NS
         JSR_TO_MAIN JUMP_TABLE_CLEAR_UPDATES
+
+        ;; Redraw after move
+        MGTK_CALL MGTK::SetPort, winfo::port
+
+        ;; Set monospaced font
+        MGTK_CALL MGTK::SetFont, monaco_font
+
+        ;; Draw welcome
+        copy16  #kLeftMargin, cursor_pos::xcoord
+        copy16  #kTopMargin, cursor_pos::ycoord
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, welcome_params
+
+        ;; Draw prompt on next line
+        add16_8 cursor_pos::ycoord, #kLineHeight
+        copy16  #kLeftMargin, cursor_pos::xcoord
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        MGTK_CALL MGTK::DrawText, prompt_params
+
+        add16_8 cursor_pos::xcoord, #35
+        copy8   #0, input_pos
+
+        ;; Redraw cursor after window move
+        jsr     DrawCursor
     END_IF
         rts
 .endproc ; OnTitleBarClick
@@ -215,8 +398,6 @@ no_mod:
 
         DA_END_AUX_SEGMENT
 
-;;; ============================================================
-;;; Main Segment
 ;;; ============================================================
 
         DA_START_MAIN_SEGMENT

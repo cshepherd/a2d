@@ -1,6 +1,6 @@
 this.apple                      Modules                         required
 show.text.file                  Modules                         optional
-dsh                             Modules                         optional
+dsh                             Apple.Menu                      optional
 show.image.file                 Modules                         optional
 show.font.file                  Modules                         optional
 show.duet.file                  Modules                         optional
