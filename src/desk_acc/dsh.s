@@ -11,6 +11,7 @@
         .include "../inc/macros.inc"
         .include "../inc/prodos.inc"
         .include "../mgtk/mgtk.inc"
+        .include "../toolkits/letk.inc"
         .include "../common.inc"
         .include "../desktop/desktop.inc"
 
@@ -98,9 +99,6 @@ kInputBufferSize = 80
 input_buffer:   .res    kInputBufferSize, 0
 input_pos:      .byte   0
 
-;;; Simple redraw flag - just redraw welcome + prompt for now
-needs_redraw:   .byte   0
-
 .params welcome_params
 textptr:        .addr   welcome_string+1
 textlen:        .byte   .strlen("Welcome to dsh.")
@@ -123,19 +121,14 @@ textptr:        .addr   space_char
 textlen:        .byte   1
 .endparams
 
-;;; Cursor drawing params
-.params cursor_line
-xdelta: .word   0
-ydelta: .word   AS_WORD(-kLineHeight)
-.endparams
+;;; LineEdit control for input
+kPromptWidth = 35
+kInputLeft = kLeftMargin + kPromptWidth
+kInputTop = kTopMargin + kLineHeight
+kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 
-.params penXOR
-penmode:        .byte   MGTK::pencopy|MGTK::notpencopy  ; XOR mode
-.endparams
-
-.params penCopy
-penmode:        .byte   MGTK::pencopy
-.endparams
+        DEFINE_LINE_EDIT line_edit_rec, kDAWindowId, input_buffer, kInputLeft, kInputTop, kInputWidth, kInputBufferSize-1
+        DEFINE_LINE_EDIT_PARAMS le_params, line_edit_rec
 
 ;;; ============================================================
 
@@ -158,11 +151,12 @@ penmode:        .byte   MGTK::pencopy
         MGTK_CALL MGTK::MoveTo, cursor_pos
         MGTK_CALL MGTK::DrawText, prompt_params
 
-        add16_8 cursor_pos::xcoord, #35
-        copy8   #0, input_pos
+        ;; Initialize input buffer
+        copy8   #0, input_buffer
 
-        ;; Draw initial cursor
-        jsr     DrawCursor
+        ;; Initialize and activate line edit control
+        LETK_CALL LETK::Init, le_params
+        LETK_CALL LETK::Activate, le_params
 
         MGTK_CALL MGTK::FlushEvents
         jmp     InputLoop
@@ -171,14 +165,20 @@ penmode:        .byte   MGTK::pencopy
 ;;; ============================================================
 
 .proc InputLoop
+        LETK_CALL LETK::Idle, le_params
         JSR_TO_MAIN JUMP_TABLE_SYSTEM_TASK
-        MGTK_CALL MGTK::GetEvent, event_params
+        jsr     GetNextEvent
         lda     event_params
         cmp     #MGTK::EventKind::key_down
         beq     OnKeyDown
         cmp     #MGTK::EventKind::button_down
-        bne     InputLoop
+        beq     OnButtonDown
+        cmp     #kEventKindMouseMoved
+        bne     :+
+        jmp     OnMouseMove
+:       jmp     InputLoop
 
+OnButtonDown:
         FALL_THROUGH_TO OnButtonDown
 .endproc ; InputLoop
 
@@ -196,9 +196,20 @@ penmode:        .byte   MGTK::pencopy
 
         cmp     #MGTK::Area::dragbar
         beq     title
+
+        cmp     #MGTK::Area::content
+        beq     content
         jmp     InputLoop
 
 title:  jsr     OnTitleBarClick
+        jmp     InputLoop
+
+content:
+        ;; Content click - convert to window coords and pass to LETK
+        copy8   #kDAWindowId, screentowindow_params::window_id
+        MGTK_CALL MGTK::ScreenToWindow, screentowindow_params
+        COPY_STRUCT screentowindow_params::window, le_params::coords
+        LETK_CALL LETK::Click, le_params
         jmp     InputLoop
 .endproc ; OnButtonDown
 
@@ -214,7 +225,8 @@ title:  jsr     OnTitleBarClick
         cmp     #kShortcutCloseWindow
         jeq     DoClose
 
-        jmp     InputLoop
+        ;; Pass modified keys to LETK
+        jmp     pass_to_letk
 
 no_mod:
         lda     event_params::key
@@ -225,116 +237,86 @@ no_mod:
         cmp     #CHAR_RETURN
         beq     HandleReturn
 
-        cmp     #CHAR_DELETE
-        beq     HandleBackspace
+        ;; Fall through to pass key to LETK
 
-        cmp     #CHAR_LEFT
-        beq     HandleBackspace
-
-        cmp     #' '
-        bcc     InputLoop
-        cmp     #$7F
-        bcs     InputLoop
-
-        jsr     HandleChar
+pass_to_letk:
+        lda     event_params::key
+        ldx     event_params::modifiers
+        sta     le_params::key
+        stx     le_params::modifiers
+        LETK_CALL LETK::Key, le_params
         jmp     InputLoop
 
 HandleReturn:
         jsr     HandleEnter
         jmp     InputLoop
-
-HandleBackspace:
-        jsr     HandleDelete
-        jmp     InputLoop
 .endproc ; OnKeyDown
 
 ;;; ============================================================
 
-.proc HandleChar
-        lda     input_pos
-        cmp     #kInputBufferSize-1
-        bcs     done
-
-        ;; Erase cursor at current position
-        jsr     DrawCursor
-
-        tax
-        lda     event_params::key
-        sta     input_buffer,x
-        inc     input_pos
-
-        sta     char_buf
-
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::DrawText, char_params
-
-        add16_8 cursor_pos::xcoord, #7
-
-        ;; Draw cursor at new position
-        jsr     DrawCursor
-
-done:   rts
-.endproc ; HandleChar
-
-;;; ============================================================
-
 .proc HandleEnter
-        ;; Erase cursor at current position
-        jsr     DrawCursor
+        ;; Deactivate line edit
+        LETK_CALL LETK::Deactivate, le_params
 
+        ;; Move to next line
         add16_8 cursor_pos::ycoord, #kLineHeight
         copy16  #kLeftMargin, cursor_pos::xcoord
 
+        ;; Check if we're past the bottom of the window
         lda     cursor_pos::ycoord+1
-        bne     reset
+        bne     wrap_to_top         ; High byte set, definitely too far
         lda     cursor_pos::ycoord
         cmp     #(kDAHeight - kLineHeight)
         bcc     draw_prompt
 
-reset:  copy16  #kTopMargin, cursor_pos::ycoord
+wrap_to_top:
+        ;; Wrap back to top
+        copy16  #kTopMargin, cursor_pos::ycoord
 
 draw_prompt:
+        ;; Update line edit rect y1 and y2 to new line position
+        ;; LineEditRecord layout: window_id(1), a_buf(2), rect(8 bytes: x1,y1,x2,y2)
+        ;; rect.y1 is at offset 5, rect.y2 is at offset 9
+        copy16  cursor_pos::ycoord, line_edit_rec+5  ; rect.y1
+        add16   cursor_pos::ycoord, #kTextBoxHeight, line_edit_rec+9  ; rect.y2
+
+        ;; Draw prompt
         MGTK_CALL MGTK::MoveTo, cursor_pos
         MGTK_CALL MGTK::DrawText, prompt_params
 
-        add16_8 cursor_pos::xcoord, #35
+        ;; Clear input buffer
+        copy8   #0, input_buffer
 
-        copy8   #0, input_pos
-
-        ;; Draw cursor at new position
-        jsr     DrawCursor
+        ;; Reactivate line edit (moves caret to end, which is the beginning since buffer is empty)
+        LETK_CALL LETK::Activate, le_params
         rts
 .endproc ; HandleEnter
 
 ;;; ============================================================
 
-.proc HandleDelete
-        lda     input_pos
-        beq     done
-
-        ;; Erase cursor at current position
-        jsr     DrawCursor
-
-        dec     input_pos
-
-        sub16_8 cursor_pos::xcoord, #7
-
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::DrawText, space_params
-
-        ;; Draw cursor at new position
-        jsr     DrawCursor
-
-done:   rts
-.endproc ; HandleDelete
+.proc OnMouseMove
+        copy8   #kDAWindowId, screentowindow_params::window_id
+        MGTK_CALL MGTK::ScreenToWindow, screentowindow_params
+        MGTK_CALL MGTK::MoveTo, screentowindow_params::window
+        MGTK_CALL MGTK::InRect, line_edit_rec::rect
+    IF ZERO
+        MGTK_CALL MGTK::SetCursor, MGTK::SystemCursor::pointer
+    ELSE
+        MGTK_CALL MGTK::SetCursor, MGTK::SystemCursor::ibeam
+    END_IF
+        jmp     InputLoop
+.endproc ; OnMouseMove
 
 ;;; ============================================================
 
 .proc OnCloseClick
         MGTK_CALL MGTK::TrackGoAway, trackgoaway_params
         lda     trackgoaway_params::goaway
-        bne     DoClose
-        jmp     InputLoop
+        beq     :+
+        MGTK_CALL MGTK::CloseWindow, winfo
+        JSR_TO_MAIN JUMP_TABLE_CLEAR_UPDATES
+        rts                     ; Exit the DA
+:       jmp     InputLoop
 .endproc ; OnCloseClick
 
 .proc DoClose
@@ -342,17 +324,6 @@ done:   rts
         JSR_TO_MAIN JUMP_TABLE_CLEAR_UPDATES
         rts
 .endproc ; DoClose
-
-;;; ============================================================
-;;; Draw text cursor at current position
-
-.proc DrawCursor
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::SetPenMode, penXOR
-        MGTK_CALL MGTK::Line, cursor_line
-        MGTK_CALL MGTK::SetPenMode, penCopy
-        rts
-.endproc ; DrawCursor
 
 ;;; ============================================================
 
@@ -381,11 +352,8 @@ done:   rts
         MGTK_CALL MGTK::MoveTo, cursor_pos
         MGTK_CALL MGTK::DrawText, prompt_params
 
-        add16_8 cursor_pos::xcoord, #35
-        copy8   #0, input_pos
-
-        ;; Redraw cursor after window move
-        jsr     DrawCursor
+        ;; Redraw line edit after window move
+        LETK_CALL LETK::Update, le_params
     END_IF
         rts
 .endproc ; OnTitleBarClick
@@ -393,6 +361,7 @@ done:   rts
 ;;; ============================================================
 
         .include "../lib/uppercase.s"
+        .include "../lib/get_next_event.s"
 
 ;;; ============================================================
 
