@@ -124,7 +124,7 @@ textlen:        .byte   1
 ;;; LineEdit control for input
 kPromptWidth = 35
 kInputLeft = kLeftMargin + kPromptWidth
-kInputTop = kTopMargin + kLineHeight
+kInputTop = kTopMargin  ; Position rect so text baseline (at rect.top+10) aligns with prompt at y=20
 kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 
         DEFINE_LINE_EDIT line_edit_rec, kDAWindowId, input_buffer, kInputLeft, kInputTop, kInputWidth, kInputBufferSize-1
@@ -277,8 +277,9 @@ draw_prompt:
         ;; Update line edit rect y1 and y2 to new line position
         ;; LineEditRecord layout: window_id(1), a_buf(2), rect(8 bytes: x1,y1,x2,y2)
         ;; rect.y1 is at offset 5, rect.y2 is at offset 9
-        copy16  cursor_pos::ycoord, line_edit_rec+5  ; rect.y1
-        add16   cursor_pos::ycoord, #kTextBoxHeight, line_edit_rec+9  ; rect.y2
+        ;; cursor_pos::ycoord is the text baseline, rect.y1 should be kLineHeight above it
+        sub16   cursor_pos::ycoord, #kLineHeight, line_edit_rec+5  ; rect.y1
+        add16   line_edit_rec+5, #kTextBoxHeight, line_edit_rec+9  ; rect.y2
 
         ;; Draw prompt
         MGTK_CALL MGTK::MoveTo, cursor_pos
