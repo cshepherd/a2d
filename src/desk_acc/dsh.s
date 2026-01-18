@@ -561,9 +561,44 @@ needs_scroll:
         ;; Activate scrollbar
         MGTK_CALL MGTK::ActivateCtl, activate_params
 
-        ;; Calculate thumb position: top_line_index * 32 / (total_lines - kMaxVisibleLines)
-        ;; If we're at the bottom, position should be 32
-        sub16   total_lines, #kMaxVisibleLines, max_scroll
+        ;; Calculate thumb size: vthumbmax = min(32, (kMaxVisibleLines * 32) / total_lines)
+        ;; Simple approximation: vthumbmax = 32 * 13 / total_lines
+        lda     total_lines
+        cmp     #kMaxVisibleLines-1
+        bcs     calc_size
+        lda     #32             ; If total <= visible, full size
+        sta     winfo::vthumbmax
+        jmp     calc_thumbpos
+
+calc_size:
+        ;; vthumbmax ≈ (13 * 32) / total_lines = 416 / total_lines
+        ;; Use table lookup for common sizes
+        lda     total_lines
+        cmp     #16
+        bcc     size_16
+        cmp     #26
+        bcc     size_26
+        cmp     #52
+        bcc     size_52
+        lda     #4              ; For very large histories
+        sta     winfo::vthumbmax
+        jmp     calc_thumbpos
+
+size_16:
+        lda     #26             ; 416/16 = 26
+        sta     winfo::vthumbmax
+        jmp     calc_thumbpos
+size_26:
+        lda     #16             ; 416/26 = 16
+        sta     winfo::vthumbmax
+        jmp     calc_thumbpos
+size_52:
+        lda     #8              ; 416/52 = 8
+        sta     winfo::vthumbmax
+
+calc_thumbpos:
+        ;; Calculate thumb position: top_line_index * 32 / (total_lines - (kMaxVisibleLines-1))
+        sub16   total_lines, #kMaxVisibleLines-1, max_scroll
         lda     max_scroll+1
         bne     :+
         lda     max_scroll
@@ -590,8 +625,8 @@ at_bottom:
         MGTK_CALL MGTK::UpdateThumb, updatethumb_params
         rts
 
-max_scroll: .word 0
-temp:   .word   0
+max_scroll:     .word   0
+temp:           .word   0
 
 .params activate_params
 which_ctl:      .byte   MGTK::Ctl::vertical_scroll_bar
@@ -617,10 +652,12 @@ thumbpos:       .byte   0
         jsr     GetNextEvent
         lda     event_params
         cmp     #MGTK::EventKind::key_down
-        beq     OnKeyDown
-        cmp     #MGTK::EventKind::button_down
-        beq     OnButtonDown
-        cmp     #kEventKindMouseMoved
+        bne     :+
+        jmp     OnKeyDown
+:       cmp     #MGTK::EventKind::button_down
+        bne     :+
+        jmp     OnButtonDown
+:       cmp     #kEventKindMouseMoved
         bne     :+
         jmp     OnMouseMove
 :       jmp     InputLoop
@@ -652,13 +689,173 @@ title:  jsr     OnTitleBarClick
         jmp     InputLoop
 
 content:
+        ;; Check if click is on a scrollbar
+        MGTK_CALL MGTK::FindControl, findcontrol_params
+        lda     findcontrol_params::which_ctl
+        cmp     #MGTK::Ctl::vertical_scroll_bar
+        beq     vscroll
+
         ;; Content click - convert to window coords and pass to LETK
         copy8   #kDAWindowId, screentowindow_params::window_id
         MGTK_CALL MGTK::ScreenToWindow, screentowindow_params
         COPY_STRUCT screentowindow_params::window, le_params::coords
         LETK_CALL LETK::Click, le_params
         jmp     InputLoop
+
+vscroll:
+        jmp     OnVScroll
 .endproc ; OnButtonDown
+
+;;; ============================================================
+
+.proc OnVScroll
+        ;; Find which part of the scrollbar was clicked
+        MGTK_CALL MGTK::FindControl, findcontrol_params
+        lda     findcontrol_params::which_part
+        cmp     #MGTK::Part::thumb
+        bne     :+
+        jmp     OnThumb
+:       cmp     #MGTK::Part::page_down
+        bne     :+
+        jmp     OnPageDown
+:       cmp     #MGTK::Part::page_up
+        bne     :+
+        jmp     OnPageUp
+:       cmp     #MGTK::Part::up_arrow
+        bne     :+
+        jmp     OnLineUp
+:       cmp     #MGTK::Part::down_arrow
+        bne     :+
+        jmp     OnLineDown
+:       jmp     InputLoop
+
+OnThumb:
+        ;; Track thumb dragging
+        copy8   #MGTK::Ctl::vertical_scroll_bar, trackthumb_params::which_ctl
+        MGTK_CALL MGTK::TrackThumb, trackthumb_params
+        lda     trackthumb_params::thumbmoved
+        bne     :+
+        jmp     done
+:
+        ;; Calculate new top_line_index from thumb position
+        ;; top_line_index = thumbpos * max_scroll / 32
+        ;; where max_scroll = total_lines - (kMaxVisibleLines - 1)
+        sub16   total_lines, #kMaxVisibleLines-1, max_scroll
+        lda     max_scroll+1
+        bmi     thumb_done      ; No scrolling needed
+        bne     :+
+        lda     max_scroll
+        bne     :+
+thumb_done:
+        jmp     done
+:
+        ;; Multiply thumbpos by max_scroll
+        lda     trackthumb_params::thumbpos
+        sta     muldiv_num
+        lda     #0
+        sta     muldiv_num+1
+        copy16  max_scroll, muldiv_mult
+        jsr     Multiply16      ; Result in muldiv_result
+
+        ;; Divide by 32
+        lda     muldiv_result+1
+        lsr     a
+        lsr     a
+        lsr     a
+        sta     top_line_index+1
+        lda     muldiv_result
+        lsr     a
+        lsr     a
+        lsr     a
+        ora     top_line_index+1
+        sta     top_line_index
+        lda     muldiv_result+1
+        and     #$07
+        sta     top_line_index+1
+
+        jsr     RedrawContent
+        jmp     InputLoop
+
+OnPageDown:
+        ;; Scroll down by visible page
+        add16   top_line_index, #kMaxVisibleLines-1, top_line_index
+        sub16   total_lines, #kMaxVisibleLines-1, max_scroll
+        cmp16   top_line_index, max_scroll
+        bcc     :+
+        copy16  max_scroll, top_line_index
+:       jsr     RedrawContent
+        jmp     InputLoop
+
+OnPageUp:
+        ;; Scroll up by visible page
+        sub16   top_line_index, #kMaxVisibleLines-1, top_line_index
+        lda     top_line_index+1
+        bpl     :+
+        copy16  #0, top_line_index
+:       jsr     RedrawContent
+        jmp     InputLoop
+
+OnLineDown:
+        ;; Scroll down by one line
+        inc16   top_line_index
+        sub16   total_lines, #kMaxVisibleLines-1, max_scroll
+        cmp16   top_line_index, max_scroll
+        bcc     :+
+        copy16  max_scroll, top_line_index
+:       jsr     RedrawContent
+        jmp     InputLoop
+
+OnLineUp:
+        ;; Scroll up by one line
+        lda     top_line_index
+        bne     :+
+        lda     top_line_index+1
+        beq     done
+:       dec16   top_line_index
+        jsr     RedrawContent
+        jmp     InputLoop
+
+done:   jmp     InputLoop
+
+max_scroll:     .word   0
+muldiv_num:     .word   0
+muldiv_mult:    .word   0
+muldiv_result:  .word   0
+.endproc ; OnVScroll
+
+;;; ============================================================
+;;; Multiply 16-bit numbers
+;;; Input: muldiv_num, muldiv_mult
+;;; Output: muldiv_result
+
+.proc Multiply16
+        copy16  #0, OnVScroll::muldiv_result
+        ldx     #16
+loop:   lsr     OnVScroll::muldiv_mult+1
+        ror     OnVScroll::muldiv_mult
+        bcc     :+
+        add16   OnVScroll::muldiv_result, OnVScroll::muldiv_num, OnVScroll::muldiv_result
+:       asl     OnVScroll::muldiv_num
+        rol     OnVScroll::muldiv_num+1
+        dex
+        bne     loop
+        rts
+.endproc ; Multiply16
+
+;;; ============================================================
+;;; Redraw the window content after scrolling
+
+.proc RedrawContent
+        MGTK_CALL MGTK::SetPort, winfo::port
+        MGTK_CALL MGTK::PaintRect, winfo::maprect
+        MGTK_CALL MGTK::SetFont, monaco_font
+        jsr     RedrawAllLines
+        jsr     PositionLineEditAtBottom
+        jsr     DrawPrompt
+        jsr     UpdateScrollBar
+        LETK_CALL LETK::Update, le_params
+        rts
+.endproc ; RedrawContent
 
 ;;; ============================================================
 
