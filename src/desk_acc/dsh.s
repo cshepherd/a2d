@@ -52,10 +52,10 @@ window_id:      .byte   kDAWindowId
 options:        .byte   MGTK::Option::go_away_box
 title:          .addr   title_string
 hscroll:        .byte   MGTK::Scroll::option_none
-vscroll:        .byte   MGTK::Scroll::option_none
+vscroll:        .byte   MGTK::Scroll::option_normal
 hthumbmax:      .byte   0
 hthumbpos:      .byte   0
-vthumbmax:      .byte   0
+vthumbmax:      .byte   32
 vthumbpos:      .byte   0
 status:         .byte   0
 reserved:       .byte   0
@@ -131,6 +131,27 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
         DEFINE_LINE_EDIT_PARAMS le_params, line_edit_rec
 
 ;;; ============================================================
+;;; Line history and scrolling
+
+kMaxHistoryLines = 16           ; Maximum number of lines to keep in history
+kMaxLineLength = 80             ; Maximum length of each line
+kMaxVisibleLines = kDAHeight / kLineHeight ; ~14 lines
+kLineRecordSize = kMaxLineLength + 1 ; Pascal string: length + data
+
+;;; Line history buffer in aux memory (16 × 81 = 1296 bytes)
+line_history:   .res    kMaxHistoryLines * kLineRecordSize, 0
+
+;;; Current number of lines in history
+total_lines:    .word   0
+
+;;; Index of the first line visible at the top of the window
+top_line_index: .word   0
+
+;;; Zero page pointers for string operations
+zp_src_ptr      := $06
+zp_dst_ptr      := $08
+
+;;; ============================================================
 
 .proc Init
         MGTK_CALL MGTK::OpenWindow, winfo
@@ -139,20 +160,25 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
         ;; Set monospaced font
         MGTK_CALL MGTK::SetFont, monaco_font
 
-        ;; Draw welcome
-        copy16  #kLeftMargin, cursor_pos::xcoord
-        copy16  #kTopMargin, cursor_pos::ycoord
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::DrawText, welcome_params
+        ;; Initialize history
+        copy16  #0, total_lines
+        copy16  #0, top_line_index
 
-        ;; Draw prompt on next line
-        add16_8 cursor_pos::ycoord, #kLineHeight
-        copy16  #kLeftMargin, cursor_pos::xcoord
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::DrawText, prompt_params
+        ;; Add welcome message to history
+        ldax    #welcome_string
+        jsr     AddLineToHistory
+
+        ;; Redraw all lines (draws all except the last line)
+        jsr     RedrawAllLines
 
         ;; Initialize input buffer
         copy8   #0, input_buffer
+
+        ;; Position line edit at last line
+        jsr     PositionLineEditAtBottom
+
+        ;; Draw the prompt at the line edit position
+        jsr     DrawPrompt
 
         ;; Initialize and activate line edit control
         LETK_CALL LETK::Init, le_params
@@ -161,6 +187,427 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
         MGTK_CALL MGTK::FlushEvents
         jmp     InputLoop
 .endproc ; Init
+
+;;; ============================================================
+;;; Add a Pascal string to the line history
+;;; Input: A/X = address of Pascal string to add
+;;; Trashes: A, X, Y
+
+.proc AddLineToHistory
+        ;; Save the new line pointer
+        stax    new_line_ptr
+
+        ;; Check if we've hit max lines
+        lda     total_lines+1
+        bne     at_max
+        lda     total_lines
+        cmp     #kMaxHistoryLines
+        bcs     at_max
+        jmp     has_space
+
+at_max:
+        ;; At max - shift all lines up by one to make room
+        ;; Copy line 1 to line 0, line 2 to line 1, etc.
+        ;; We'll use GetLineAddress to calculate addresses
+
+        ;; Start with line 0 (destination)
+        copy16  #0, current_line
+
+shift_loop:
+        ;; Calculate source line index (current_line + 1)
+        add16   current_line, #1, source_line
+
+        ;; Check if we've copied all lines (source_line == kMaxHistoryLines)
+        lda     source_line
+        cmp     #kMaxHistoryLines
+        bne     continue_shift
+        lda     source_line+1
+        beq     done_shift
+continue_shift:
+        ;; Get source address
+        copy16  source_line, temp_idx
+        jsr     CalcLineAddress ; Returns address in zp_dst_ptr
+        copy16  zp_dst_ptr, saved_src
+
+        ;; Get destination address
+        copy16  current_line, temp_idx
+        jsr     CalcLineAddress ; Returns address in zp_dst_ptr
+
+        ;; Restore source address
+        copy16  saved_src, zp_src_ptr
+        ldy     #kLineRecordSize-1
+copy_byte:
+        lda     (zp_src_ptr),y
+        sta     (zp_dst_ptr),y
+        dey
+        bpl     copy_byte
+
+        ;; Move to next line
+        inc16   current_line
+        jmp     shift_loop
+
+done_shift:
+        ;; Now use the last slot (decrement total so it will be re-incremented)
+        dec16   total_lines
+
+        ;; Adjust scroll position
+        lda     top_line_index
+        bne     :+
+        lda     top_line_index+1
+        beq     has_space
+:       dec16   top_line_index
+
+has_space:
+        ;; Restore the new line pointer
+        ldax    new_line_ptr
+        stax    zp_src_ptr
+        ;; Calculate destination address: line_history + (total_lines * (kMaxLineLength+1))
+        lda     total_lines
+        sta     line_num
+        lda     total_lines+1
+        sta     line_num+1
+
+        ;; Multiply by 81 (kMaxLineLength+1)
+        ;; 81 = 64 + 16 + 1
+        copy16  line_num, zp_dst_ptr
+        lda     #0
+        sta     zp_dst_ptr+1
+
+        ;; * 64
+        ldx     #6
+:       asl16   zp_dst_ptr
+        dex
+        bne     :-
+
+        ;; + (line_num * 16)
+        copy16  line_num, temp
+        ldx     #4
+:       asl16   temp
+        dex
+        bne     :-
+        add16   zp_dst_ptr, temp, zp_dst_ptr
+
+        ;; + line_num
+        add16   zp_dst_ptr, line_num, zp_dst_ptr
+
+        ;; Add base address
+        add16   zp_dst_ptr, #line_history, zp_dst_ptr
+
+        ;; Copy the string (length + data)
+        ldy     #0
+        lda     (zp_src_ptr),y
+        sta     (zp_dst_ptr),y  ; Copy length byte
+        tay
+:       lda     (zp_src_ptr),y
+        sta     (zp_dst_ptr),y
+        dey
+        bne     :-
+
+        ;; Increment total_lines
+        inc16   total_lines
+
+        rts
+
+;;; Helper: Calculate line address from line index
+;;; Input: temp_idx = line index
+;;; Output: zp_dst_ptr = address
+;;; Trashes: A, X
+CalcLineAddress:
+        copy16  temp_idx, zp_dst_ptr
+        lda     #0
+        sta     zp_dst_ptr+1
+
+        ;; Multiply by 81 (kMaxLineLength+1)
+        ;; 81 = 64 + 16 + 1
+
+        ;; * 64
+        ldx     #6
+:       asl16   zp_dst_ptr
+        dex
+        bne     :-
+
+        ;; Save * 64
+        copy16  zp_dst_ptr, temp_64
+
+        ;; Calculate * 16
+        copy16  temp_idx, temp_offset
+        lda     #0
+        sta     temp_offset+1
+        ldx     #4
+:       asl16   temp_offset
+        dex
+        bne     :-
+
+        ;; Add: *64 + *16 + original
+        add16   zp_dst_ptr, temp_offset, zp_dst_ptr
+        add16   zp_dst_ptr, temp_idx, zp_dst_ptr
+
+        ;; Add base address
+        add16   zp_dst_ptr, #line_history, zp_dst_ptr
+        rts
+
+line_num:       .word   0
+temp:           .word   0
+new_line_ptr:   .addr   0
+current_line:   .word   0
+source_line:    .word   0
+temp_idx:       .word   0
+temp_offset:    .word   0
+temp_64:        .word   0
+saved_src:      .word   0
+.endproc ; AddLineToHistory
+
+;;; ============================================================
+;;; Redraw all visible lines from history
+;;; Trashes: A, X, Y
+
+.proc RedrawAllLines
+        ;; Calculate how many lines to draw
+        ;; min(total_lines - top_line_index, kMaxVisibleLines - 1)
+        ;; (Leave room for the active prompt line at the bottom)
+        sub16   total_lines, top_line_index, lines_to_draw
+        lda     lines_to_draw+1
+        bne     use_max         ; If > 255, use max
+        lda     lines_to_draw
+        cmp     #kMaxVisibleLines-1
+        bcs     use_max
+        jmp     start_draw
+use_max:
+        lda     #kMaxVisibleLines-1
+        sta     lines_to_draw
+        lda     #0
+        sta     lines_to_draw+1
+
+start_draw:
+        ;; Start at top of window
+        copy16  #kLeftMargin, cursor_pos::xcoord
+        copy16  #kTopMargin, cursor_pos::ycoord
+
+        ;; Start with top_line_index
+        copy16  top_line_index, current_line
+
+loop:
+        ;; Check if done
+        lda     lines_to_draw
+        ora     lines_to_draw+1
+        beq     done
+
+        ;; Get line address
+        jsr     GetLineAddress  ; Returns address in zp_src_ptr
+
+        ;; Draw the line
+        MGTK_CALL MGTK::MoveTo, cursor_pos
+        ldy     #0
+        lda     (zp_src_ptr),y  ; Get length
+        beq     next_line       ; Skip empty lines
+        sta     draw_params::textlen
+        inc16   zp_src_ptr
+        copy16  zp_src_ptr, draw_params::textptr
+        MGTK_CALL MGTK::DrawText, draw_params
+
+next_line:
+        ;; Move to next line
+        add16_8 cursor_pos::ycoord, #kLineHeight
+        inc16   current_line
+        dec16   lines_to_draw
+        jmp     loop
+
+done:   rts
+
+lines_to_draw: .word 0
+current_line: .word 0
+
+.params draw_params
+textptr: .addr  0
+textlen: .byte  0
+.endparams
+.endproc ; RedrawAllLines
+
+;;; ============================================================
+;;; Get address of a line in history
+;;; Input: current_line (from RedrawAllLines)
+;;; Output: zp_src_ptr
+;;; Trashes: A, X
+
+.proc GetLineAddress
+        ;; Calculate address: line_history + (current_line * 81)
+        copy16  RedrawAllLines::current_line, line_num
+
+        ;; Multiply by 81 (64 + 16 + 1)
+        copy16  line_num, addr
+        lda     #0
+        sta     addr+1
+
+        ;; * 64
+        ldx     #6
+:       asl16   addr
+        dex
+        bne     :-
+
+        ;; + (line_num * 16)
+        copy16  line_num, temp
+        ldx     #4
+:       asl16   temp
+        dex
+        bne     :-
+        add16   addr, temp, addr
+
+        ;; + line_num
+        add16   addr, line_num, addr
+
+        ;; Add base
+        add16   addr, #line_history, addr
+        copy16  addr, zp_src_ptr
+
+        rts
+
+line_num: .word 0
+addr:   .addr   0
+temp:   .word   0
+.endproc ; GetLineAddress
+
+;;; ============================================================
+;;; Position line edit control at the bottom visible line
+
+.proc PositionLineEditAtBottom
+        ;; Calculate number of visible history lines
+        ;; min(total_lines - top_line_index, kMaxVisibleLines - 1)
+        sub16   total_lines, top_line_index, visible_lines
+        lda     visible_lines+1
+        bne     use_max
+        lda     visible_lines
+        cmp     #kMaxVisibleLines-1
+        bcs     use_max
+        jmp     calc_pos
+use_max:
+        lda     #kMaxVisibleLines-1
+        sta     visible_lines
+        lda     #0
+        sta     visible_lines+1
+
+        ;; Calculate line edit rect.y1 position
+        ;; The prompt line comes after visible_lines history lines
+        ;; Text baseline for prompt should be at: kTopMargin + visible_lines * kLineHeight
+        ;; But rect.y1 is kTextBoxTextVOffset pixels above the baseline
+        ;; So: rect.y1 = kTopMargin + visible_lines * kLineHeight - kTextBoxTextVOffset
+        ;;            = kTopMargin + visible_lines * kLineHeight - kTopMargin  (since both = 10)
+        ;;            = visible_lines * kLineHeight
+calc_pos:
+        copy16  visible_lines, temp
+        lda     #0
+        sta     temp+1
+
+        ;; Multiply by 10 (kLineHeight)
+        ldx     #3              ; * 8
+:       asl16   temp
+        dex
+        bne     :-
+        add16   temp, visible_lines, temp ; * 8 + visible_lines = * 9
+        add16   temp, visible_lines, temp ; * 9 + visible_lines = * 10
+
+        ;; temp now has visible_lines * kLineHeight, which is the rect.y1 position
+
+        ;; Update line edit rect y positions
+        copy16  temp, line_edit_rec+5    ; rect.y1
+        add16   temp, #kTextBoxHeight, line_edit_rec+9  ; rect.y2
+
+        rts
+
+visible_lines: .word 0
+temp:   .word   0
+.endproc ; PositionLineEditAtBottom
+
+;;; ============================================================
+;;; Draw the prompt at the current line edit position
+;;; This should be called after PositionLineEditAtBottom
+
+.proc DrawPrompt
+        ;; Calculate the text baseline position
+        ;; The line edit rect.y1 is 10 pixels above the text baseline
+        ;; So baseline_y = rect.y1 + kTextBoxTextVOffset
+        copy16  line_edit_rec+5, prompt_pos+MGTK::Point::ycoord  ; Start with rect.y1
+        add16_8 prompt_pos+MGTK::Point::ycoord, #kTextBoxTextVOffset ; Add offset to baseline
+        copy16  #kLeftMargin, prompt_pos+MGTK::Point::xcoord
+
+        MGTK_CALL MGTK::MoveTo, prompt_pos
+        MGTK_CALL MGTK::DrawText, prompt_text_params
+        rts
+
+        DEFINE_POINT prompt_pos, 0, 0
+
+.params prompt_text_params
+textptr:        .addr   prompt_string+1
+textlen:        .byte   5               ; "dsh% " is 5 characters
+.endparams
+.endproc ; DrawPrompt
+
+;;; ============================================================
+;;; Update scrollbar position and activation state
+
+.proc UpdateScrollBar
+        ;; Check if scrolling is needed
+        ;; If total_lines <= kMaxVisibleLines, deactivate scrollbar
+        lda     total_lines+1
+        bne     needs_scroll
+        lda     total_lines
+        cmp     #kMaxVisibleLines+1
+        bcs     needs_scroll
+
+        ;; Deactivate scrollbar
+        MGTK_CALL MGTK::ActivateCtl, deactivate_params
+        rts
+
+needs_scroll:
+        ;; Activate scrollbar
+        MGTK_CALL MGTK::ActivateCtl, activate_params
+
+        ;; Calculate thumb position: top_line_index * 32 / (total_lines - kMaxVisibleLines)
+        ;; If we're at the bottom, position should be 32
+        sub16   total_lines, #kMaxVisibleLines, max_scroll
+        lda     max_scroll+1
+        bne     :+
+        lda     max_scroll
+        beq     at_bottom       ; Exactly at capacity
+
+:       ;; Calculate: top_line_index * 32 / max_scroll
+        copy16  top_line_index, temp
+        lda     #0
+        sta     temp+1
+        ldx     #5              ; * 32
+:       asl16   temp
+        dex
+        bne     :-
+
+        ;; Divide by max_scroll (simplified - just clamp to 32)
+        lda     temp+1
+        bne     at_bottom
+        lda     temp
+        cmp     #32
+        bcc     :+
+at_bottom:
+        lda     #32
+:       sta     winfo::vthumbpos
+        MGTK_CALL MGTK::UpdateThumb, updatethumb_params
+        rts
+
+max_scroll: .word 0
+temp:   .word   0
+
+.params activate_params
+which_ctl:      .byte   MGTK::Ctl::vertical_scroll_bar
+activate:       .byte   MGTK::activatectl_activate
+.endparams
+
+.params deactivate_params
+which_ctl:      .byte   MGTK::Ctl::vertical_scroll_bar
+activate:       .byte   MGTK::activatectl_deactivate
+.endparams
+
+.params updatethumb_params
+which_ctl:      .byte   MGTK::Ctl::vertical_scroll_bar
+thumbpos:       .byte   0
+.endparams
+.endproc ; UpdateScrollBar
 
 ;;; ============================================================
 
@@ -258,39 +705,79 @@ HandleReturn:
         ;; Deactivate line edit
         LETK_CALL LETK::Deactivate, le_params
 
-        ;; Move to next line
-        add16_8 cursor_pos::ycoord, #kLineHeight
-        copy16  #kLeftMargin, cursor_pos::xcoord
+        ;; Create a line with prompt + input text and add to history
+        ;; Format: "dsh% [user input]"
+        ldy     #0
+        ldx     prompt_string   ; Get prompt length
+:       lda     prompt_string,y
+        sta     temp_line,y
+        iny
+        dex
+        bpl     :-
 
-        ;; Check if we're past the bottom of the window
-        lda     cursor_pos::ycoord+1
-        bne     wrap_to_top         ; High byte set, definitely too far
-        lda     cursor_pos::ycoord
-        cmp     #(kDAHeight - kLineHeight)
-        bcc     draw_prompt
+        ;; Now append the input buffer
+        ldy     temp_line       ; Current length (destination index)
+        ldx     #1              ; Start at first char of input (after length byte)
+        lda     input_buffer    ; Get input length
+        beq     done_append     ; Skip if empty
+        sta     temp_len        ; Save it
+append_loop:
+        lda     input_buffer,x  ; Copy from input buffer
+        sta     temp_line+1,y   ; Store in temp_line
+        iny
+        inx
+        cpx     temp_len
+        bcc     append_loop
+        beq     append_loop
+done_append:
+        sty     temp_line       ; Update total length
 
-wrap_to_top:
-        ;; Wrap back to top
-        copy16  #kTopMargin, cursor_pos::ycoord
+        ;; Add the complete line to history
+        ldax    #temp_line
+        jsr     AddLineToHistory
 
-draw_prompt:
-        ;; Update line edit rect y1 and y2 to new line position
-        ;; LineEditRecord layout: window_id(1), a_buf(2), rect(8 bytes: x1,y1,x2,y2)
-        ;; rect.y1 is at offset 5, rect.y2 is at offset 9
-        ;; cursor_pos::ycoord is the text baseline, rect.y1 should be kLineHeight above it
-        sub16   cursor_pos::ycoord, #kLineHeight, line_edit_rec+5  ; rect.y1
-        add16   line_edit_rec+5, #kTextBoxHeight, line_edit_rec+9  ; rect.y2
+        ;; Adjust scroll position to ensure the new line is visible
+        ;; We can show kMaxVisibleLines - 1 history lines (leaving room for prompt)
+        ;; So: top_line_index = max(0, total_lines - (kMaxVisibleLines - 1))
+        sub16   total_lines, #kMaxVisibleLines-1, temp_scroll
+        ;; If temp_scroll < 0, keep top_line_index at 0
+        lda     temp_scroll+1
+        bmi     no_scroll_adjust
+        ;; Otherwise, set top_line_index = max(top_line_index, temp_scroll)
+        cmp16   temp_scroll, top_line_index
+        bcc     no_scroll_adjust        ; temp_scroll < top_line_index, no change needed
+        copy16  temp_scroll, top_line_index
 
-        ;; Draw prompt
-        MGTK_CALL MGTK::MoveTo, cursor_pos
-        MGTK_CALL MGTK::DrawText, prompt_params
+no_scroll_adjust:
+        ;; Clear the window and redraw all lines
+        MGTK_CALL MGTK::SetPort, winfo::port
+        MGTK_CALL MGTK::PaintRect, winfo::maprect
+
+        ;; Set font again after clearing
+        MGTK_CALL MGTK::SetFont, monaco_font
+
+        ;; Redraw all visible lines (all except the last)
+        jsr     RedrawAllLines
+
+        ;; Position line edit at bottom
+        jsr     PositionLineEditAtBottom
+
+        ;; Draw the prompt at the line edit position
+        jsr     DrawPrompt
+
+        ;; Update scrollbar
+        jsr     UpdateScrollBar
 
         ;; Clear input buffer
         copy8   #0, input_buffer
 
-        ;; Reactivate line edit (moves caret to end, which is the beginning since buffer is empty)
+        ;; Reactivate line edit
         LETK_CALL LETK::Activate, le_params
         rts
+
+temp_scroll:    .word   0
+temp_line:      .res    90, 0  ; Prompt + input (80 + 10 for prompt)
+temp_len:       .byte   0
 .endproc ; HandleEnter
 
 ;;; ============================================================
