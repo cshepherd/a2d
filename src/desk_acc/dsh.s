@@ -133,7 +133,7 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 ;;; ============================================================
 ;;; Line history and scrolling
 
-kMaxHistoryLines = 16           ; Maximum number of lines to keep in history
+kMaxHistoryLines = 12           ; Maximum number of lines to keep in history
 kMaxLineLength = 80             ; Maximum length of each line
 kMaxVisibleLines = kDAHeight / kLineHeight ; ~14 lines
 kLineRecordSize = kMaxLineLength + 1 ; Pascal string: length + data
@@ -933,6 +933,12 @@ done_append:
         ldax    #temp_line
         jsr     AddLineToHistory
 
+        ;; Parse and execute the command
+        lda     input_buffer    ; Check if input is empty
+        beq     no_command
+        jsr     ParseCommand
+
+no_command:
         ;; Adjust scroll position to ensure the new line is visible
         ;; We can show kMaxVisibleLines - 1 history lines (leaving room for prompt)
         ;; So: top_line_index = max(0, total_lines - (kMaxVisibleLines - 1))
@@ -976,6 +982,94 @@ temp_scroll:    .word   0
 temp_line:      .res    90, 0  ; Prompt + input (80 + 10 for prompt)
 temp_len:       .byte   0
 .endproc ; HandleEnter
+
+;;; ============================================================
+;;; Parse and execute a command
+;;; Input: input_buffer contains the command
+
+.proc ParseCommand
+        ;; Check length and dispatch to appropriate command
+        lda     input_buffer
+        cmp     #3
+        beq     check_pwd
+        cmp     #7
+        beq     check_version
+        rts
+
+check_pwd:
+        ;; Check if command is "pwd"
+        ldx     #0
+:       lda     input_buffer+1,x
+        jsr     ToUpperCase
+        cmp     pwd_cmd,x
+        bne     done
+        inx
+        cpx     #3
+        bne     :-
+        jmp     cmd_pwd
+
+check_version:
+        ;; Check if command is "version"
+        ldx     #0
+:       lda     input_buffer+1,x
+        jsr     ToUpperCase
+        cmp     version_cmd,x
+        bne     done
+        inx
+        cpx     #7
+        bne     :-
+        jmp     cmd_version
+
+done:   rts
+
+;;; --------------------------------------------------
+;;; Execute "version" command
+
+cmd_version:
+        ldax    #version_output
+        jsr     AddLineToHistory
+        rts
+
+;;; --------------------------------------------------
+;;; Execute "pwd" command - print working directory
+
+cmd_pwd:
+        ;; Call GetPrefix in main memory
+        JSR_TO_MAIN GetPrefixMain
+        bcs     pwd_error
+
+        ;; Use AUXMOVE to copy from main to aux
+        ;; AUXMOVE params: STARTLO/HI, ENDLO/HI, DESTINATIONLO/HI
+        copy16  #prefix_buffer_main, STARTLO            ; Source start
+        copy16  #(prefix_buffer_main+65), ENDLO         ; Source end
+        copy16  #prefix_buffer_aux, DESTINATIONLO       ; Dest
+
+        sec                     ; Carry set = main to aux
+        jsr     AUXMOVE
+
+        ;; Now print from aux buffer
+        ldax    #prefix_buffer_aux
+        jsr     AddLineToHistory
+        rts
+
+pwd_error:
+        ldax    #pwd_error_msg
+        jsr     AddLineToHistory
+        rts
+
+pwd_error_msg:
+        PASCAL_STRING "Error reading prefix"
+
+;;; --------------------------------------------------
+;;; Data
+
+pwd_cmd:
+        .byte   "PWD"
+version_cmd:
+        .byte   "VERSION"
+version_output:
+        PASCAL_STRING "dsh v0.1 alpha release"
+.endproc ; ParseCommand
 
 ;;; ============================================================
 
@@ -1049,6 +1143,11 @@ temp_len:       .byte   0
         .include "../lib/get_next_event.s"
 
 ;;; ============================================================
+;;; Aux buffers
+
+prefix_buffer_aux:   .res    65, 0      ; Aux copy of prefix for display
+
+;;; ============================================================
 
         DA_END_AUX_SEGMENT
 
@@ -1063,6 +1162,22 @@ temp_len:       .byte   0
         JSR_TO_AUX aux::Init
         rts
 .endproc ; Start
+
+;;; ============================================================
+;;; ProDOS GET_PREFIX helper (must be in main memory)
+
+prefix_buffer_main:  .res    65, 0      ; ProDOS prefix buffer (max 64 chars + length)
+
+DEFINE_GET_PREFIX_PARAMS getprefix_params_main, prefix_buffer_main
+
+;;; Call ProDOS GET_PREFIX - result left in prefix_buffer_main
+;;; Output: C set on error
+.proc GetPrefixMain
+        JUMP_TABLE_MLI_CALL GET_PREFIX, getprefix_params_main
+        rts
+.endproc
+
+;;; ============================================================
 
         DA_END_MAIN_SEGMENT
 
