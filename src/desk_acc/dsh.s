@@ -133,7 +133,7 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 ;;; ============================================================
 ;;; Line history and scrolling
 
-kMaxHistoryLines = 12           ; Maximum number of lines to keep in history
+kMaxHistoryLines = 10           ; Maximum number of lines to keep in history
 kMaxLineLength = 80             ; Maximum length of each line
 kMaxVisibleLines = kDAHeight / kLineHeight ; ~14 lines
 kLineRecordSize = kMaxLineLength + 1 ; Pascal string: length + data
@@ -988,7 +988,41 @@ temp_len:       .byte   0
 ;;; Input: input_buffer contains the command
 
 .proc ParseCommand
-        ;; Check length and dispatch to appropriate command
+        ;; Check for minimum length
+        lda     input_buffer
+        beq     done            ; Empty command
+        cmp     #3
+        bcc     done            ; Too short
+
+        ;; Check first 2 characters for "cd" with argument
+        lda     input_buffer
+        cmp     #4              ; "cd" + space + at least 1 char
+        bcs     check_cd        ; >= 4 chars, could be cd
+
+        ;; Check exact lengths for other commands
+        cmp     #3
+        beq     check_pwd
+        cmp     #7
+        beq     check_version
+        rts
+
+check_cd:
+        ;; Check if command starts with "cd "
+        lda     input_buffer+1
+        jsr     ToUpperCase
+        cmp     #'C'
+        bne     check_other
+        lda     input_buffer+2
+        jsr     ToUpperCase
+        cmp     #'D'
+        bne     check_other
+        lda     input_buffer+3
+        cmp     #' '
+        bne     check_other
+        jmp     cmd_cd
+
+check_other:
+        ;; Check exact length commands
         lda     input_buffer
         cmp     #3
         beq     check_pwd
@@ -1059,6 +1093,57 @@ pwd_error:
 
 pwd_error_msg:
         PASCAL_STRING "Error reading prefix"
+
+;;; --------------------------------------------------
+;;; Execute "cd" command - change directory
+
+cmd_cd:
+        ;; Extract the path argument (starts at input_buffer+4)
+        ;; Copy to cd_path_buffer in aux, then copy to main for ProDOS
+        lda     input_buffer    ; Total length
+        sec
+        sbc     #3              ; Subtract "cd " (3 chars)
+        sta     cd_path_buffer  ; Store path length
+
+        ;; Copy path characters
+        tax
+        beq     cd_done         ; Empty path?
+:       lda     input_buffer+3,x ; +3 to skip "cd "
+        sta     cd_path_buffer,x
+        dex
+        bne     :-
+
+cd_done:
+        ;; Copy from aux to main using AUXMOVE
+        copy16  #cd_path_buffer, STARTLO
+        lda     cd_path_buffer
+        clc
+        adc     #<cd_path_buffer
+        sta     ENDLO
+        lda     #>cd_path_buffer
+        adc     #0
+        sta     ENDLO+1
+        inc16   ENDLO                   ; Make it end+1
+        copy16  #cd_path_main, DESTINATIONLO
+
+        clc                             ; Carry clear = aux to main
+        jsr     AUXMOVE
+
+        ;; Call SET_PREFIX in main memory
+        JSR_TO_MAIN SetPrefixMain
+        bcs     cd_error
+
+        ;; Success - optionally show new prefix
+        jmp     cmd_pwd
+
+cd_error:
+        ldax    #cd_error_msg
+        jsr     AddLineToHistory
+        rts
+
+cd_error_msg:
+        PASCAL_STRING "Error changing directory"
+cd_path_buffer: .res    65, 0           ; Aux buffer for cd path
 
 ;;; --------------------------------------------------
 ;;; Data
@@ -1167,13 +1252,22 @@ prefix_buffer_aux:   .res    65, 0      ; Aux copy of prefix for display
 ;;; ProDOS GET_PREFIX helper (must be in main memory)
 
 prefix_buffer_main:  .res    65, 0      ; ProDOS prefix buffer (max 64 chars + length)
+cd_path_main:        .res    65, 0      ; Main memory buffer for cd path
 
 DEFINE_GET_PREFIX_PARAMS getprefix_params_main, prefix_buffer_main
+DEFINE_SET_PREFIX_PARAMS setprefix_params_main, cd_path_main
 
 ;;; Call ProDOS GET_PREFIX - result left in prefix_buffer_main
 ;;; Output: C set on error
 .proc GetPrefixMain
         JUMP_TABLE_MLI_CALL GET_PREFIX, getprefix_params_main
+        rts
+.endproc
+
+;;; Call ProDOS SET_PREFIX - uses cd_path_main as source
+;;; Output: C set on error
+.proc SetPrefixMain
+        JUMP_TABLE_MLI_CALL SET_PREFIX, setprefix_params_main
         rts
 .endproc
 
