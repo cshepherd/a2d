@@ -84,8 +84,14 @@ nextwinfo:      .addr   0
 title_string:
         PASCAL_STRING "dsh"
 
+welcome_prefix:
+        PASCAL_STRING "Welcome to dsh - "
 welcome_string:
-        PASCAL_STRING "Welcome to dsh."
+        .res    40, 0           ; Built dynamically with RamWorks bank count
+ramworks_suffix:
+        PASCAL_STRING " RamWorks banks"
+str_from_int:
+        PASCAL_STRING "000"     ; Filled in by IntToString
 
 prompt_string:
         PASCAL_STRING "dsh% "
@@ -133,7 +139,7 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 ;;; ============================================================
 ;;; Line history and scrolling
 
-kMaxHistoryLines = 10           ; Maximum number of lines to keep in history
+kMaxHistoryLines = 6            ; Maximum number of lines to keep in history
 kMaxLineLength = 80             ; Maximum length of each line
 kMaxVisibleLines = kDAHeight / kLineHeight ; ~14 lines
 kLineRecordSize = kMaxLineLength + 1 ; Pascal string: length + data
@@ -163,6 +169,9 @@ zp_dst_ptr      := $08
         ;; Initialize history
         copy16  #0, total_lines
         copy16  #0, top_line_index
+
+        ;; Detect RamWorks banks
+        jsr     DetectRamWorks
 
         ;; Add welcome message to history
         ldax    #welcome_string
@@ -1226,11 +1235,62 @@ version_output:
 
         .include "../lib/uppercase.s"
         .include "../lib/get_next_event.s"
+        .include "../lib/inttostring.s"
+
+;;; ============================================================
+;;; RamWorks Detection
+
+.proc DetectRamWorks
+        ;; Call detection routine in main memory
+        JSR_TO_MAIN CheckRamWorksMain
+        ;; Y register contains bank count (0 = 256)
+        sty     ramworks_banks
+
+        ;; Build welcome message with bank count
+        ;; Convert bank count to string
+        lda     ramworks_banks
+        beq     is_256          ; 0 means 256 banks
+        ldx     #0              ; High byte = 0
+        jsr     IntToString     ; A = low byte, X = high byte
+        jmp     copy_str
+
+is_256: ldax    #256
+        jsr     IntToString
+
+copy_str:
+        ;; Copy "Welcome to dsh - "
+        COPY_STRING welcome_prefix, welcome_string
+
+        ;; Append bank count from str_from_int
+        ldy     welcome_string          ; Get current length
+        ldx     #0                      ; Start at index 0 (will increment to 1)
+:       inx
+        iny
+        lda     str_from_int,x          ; Copy character
+        sta     welcome_string,y
+        cpx     str_from_int            ; Compare with length byte
+        bne     :-                      ; Continue until we've copied all chars
+        sty     welcome_string          ; Update length
+
+        ;; Append " RamWorks banks"
+        ldy     welcome_string          ; Get current length
+        ldx     #0                      ; Start at index 0 (will increment to 1)
+:       inx
+        iny
+        lda     ramworks_suffix,x       ; Copy character
+        sta     welcome_string,y
+        cpx     ramworks_suffix         ; Compare with length byte
+        bne     :-                      ; Continue until we've copied all chars
+        sty     welcome_string          ; Update length
+
+        rts
+.endproc ; DetectRamWorks
 
 ;;; ============================================================
 ;;; Aux buffers
 
 prefix_buffer_aux:   .res    65, 0      ; Aux copy of prefix for display
+ramworks_banks:      .byte   0          ; Number of RamWorks banks detected (0 = 256)
 
 ;;; ============================================================
 
@@ -1270,6 +1330,75 @@ DEFINE_SET_PREFIX_PARAMS setprefix_params_main, cd_path_main
         JUMP_TABLE_MLI_CALL SET_PREFIX, setprefix_params_main
         rts
 .endproc
+
+;;; ============================================================
+;;; Detect RamWorks banks (based on this.apple.s CheckRamworksMemory)
+;;; Output: Y = number of banks (0 = 256 banks)
+;;; Note: Must be called from main memory with interrupts enabled
+
+.proc CheckRamWorksMain
+        sigb0   := $00
+        sigb1   := $01
+
+        ;; DAs are loaded with $1C00 as the io_buffer, so
+        ;; $1C00-$1FFF MAIN is free.
+        buf0    := DA_IO_BUFFER
+        buf1    := DA_IO_BUFFER + $100
+
+        php
+        sei     ; don't let interrupts happen while memory map is munged
+
+        ldy     #0              ; populated bank count
+
+        ;; Mark pass: iterate downwards, saving bytes and marking each bank
+        ldx     #255
+mark_loop:
+        stx     RAMWORKS_BANK
+        copy8   sigb0, buf0,x   ; preserve bytes
+        copy8   sigb1, buf1,x
+        txa                     ; bank num as first signature
+        sta     sigb0
+        eor     #$FF            ; complement as second signature
+        sta     sigb1
+        dex
+        cpx     #$FF
+        bne     mark_loop
+
+        ;; Count pass: iterate upwards, tallying valid banks
+        ldx     #0
+count_loop:
+        stx     RAMWORKS_BANK
+        txa
+        cmp     sigb0           ; verify first signature
+        bne     :+
+        eor     #$FF
+        cmp     sigb1           ; verify second signature
+        bne     :+
+        iny                     ; match - count it
+:       inx
+        bne     count_loop
+
+        ;; Restore pass: iterate upwards, restoring valid banks
+        ldx     #0
+restore_loop:
+        stx     RAMWORKS_BANK
+        txa
+        cmp     sigb0           ; verify first signature
+        bne     :+
+        eor     #$FF
+        cmp     sigb1           ; verify second signature
+        bne     :+
+        copy8   buf0,x, sigb0   ; match - restore it
+        copy8   buf1,x, sigb1
+:       inx
+        bne     restore_loop
+
+        ;; Switch back to bank 0 (normal aux memory)
+        copy8   #0, RAMWORKS_BANK
+
+        plp                     ; restore interrupt state
+        rts
+.endproc ; CheckRamWorksMain
 
 ;;; ============================================================
 
