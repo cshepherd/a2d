@@ -119,7 +119,14 @@ for line in $(cat src/desk_acc/TARGETS | bin/targets.pl); do
 done
 
 # --------------------------------------------------
-# Part 6: Sample Media.
+# Part 6: External Commands for dsh
+disposition="optional"
+
+emit add_file $disposition "out/hello" "COMMANDS" "hello" 000000
+emit add_file $disposition "out/pwd" "COMMANDS" "pwd" 000000
+
+# --------------------------------------------------
+# Part 7: Sample Media.
 disposition="sample"
 
 if [[ -z "$no_sample_media" ]]; then

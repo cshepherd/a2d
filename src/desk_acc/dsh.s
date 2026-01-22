@@ -47,6 +47,12 @@ kLineHeight = 10
 kLeftMargin = 3
 kTopMargin = 10
 
+;;; External command constants (shared between aux and main segments)
+kCommandBank    = 2             ; Use bank 2 for external commands
+kCommandStart   = $0800         ; Start address in RamWorks bank
+kCommandEnd     = $BFFF         ; End of usable bank-switched memory
+kMaxCommandSize = kCommandEnd - kCommandStart + 1  ; $B400 = 46,080 bytes
+
 .params winfo
 window_id:      .byte   kDAWindowId
 options:        .byte   MGTK::Option::go_away_box
@@ -87,7 +93,7 @@ title_string:
 welcome_prefix:
         PASCAL_STRING "Welcome to dsh - "
 welcome_string:
-        .res    40, 0           ; Built dynamically with RamWorks bank count
+        .res    36, 0           ; Built dynamically with RamWorks bank count
 ramworks_suffix:
         PASCAL_STRING " RamWorks banks"
 str_from_int:
@@ -139,7 +145,7 @@ kInputWidth = kDAWidth - kInputLeft - kLeftMargin
 ;;; ============================================================
 ;;; Line history and scrolling
 
-kMaxHistoryLines = 6            ; Maximum number of lines to keep in history
+kMaxHistoryLines = 3            ; Maximum number of lines to keep in history
 kMaxLineLength = 80             ; Maximum length of each line
 kMaxVisibleLines = kDAHeight / kLineHeight ; ~14 lines
 kLineRecordSize = kMaxLineLength + 1 ; Pascal string: length + data
@@ -997,23 +1003,19 @@ temp_len:       .byte   0
 ;;; Input: input_buffer contains the command
 
 .proc ParseCommand
-        ;; Check for minimum length
         lda     input_buffer
-        beq     done            ; Empty command
-        cmp     #3
-        bcc     done            ; Too short
+        bne     :+
+        jmp     done
+:
 
         ;; Check first 2 characters for "cd" with argument
-        lda     input_buffer
-        cmp     #4              ; "cd" + space + at least 1 char
-        bcs     check_cd        ; >= 4 chars, could be cd
+        cmp     #4
+        bcs     check_cd
 
         ;; Check exact lengths for other commands
-        cmp     #3
-        beq     check_pwd
         cmp     #7
         beq     check_version
-        rts
+        jmp     try_external_command
 
 check_cd:
         ;; Check if command starts with "cd "
@@ -1031,25 +1033,10 @@ check_cd:
         jmp     cmd_cd
 
 check_other:
-        ;; Check exact length commands
         lda     input_buffer
-        cmp     #3
-        beq     check_pwd
         cmp     #7
         beq     check_version
-        rts
-
-check_pwd:
-        ;; Check if command is "pwd"
-        ldx     #0
-:       lda     input_buffer+1,x
-        jsr     ToUpperCase
-        cmp     pwd_cmd,x
-        bne     done
-        inx
-        cpx     #3
-        bne     :-
-        jmp     cmd_pwd
+        jmp     try_external_command
 
 check_version:
         ;; Check if command is "version"
@@ -1057,11 +1044,53 @@ check_version:
 :       lda     input_buffer+1,x
         jsr     ToUpperCase
         cmp     version_cmd,x
-        bne     done
+        bne     try_external_command
         inx
         cpx     #7
         bne     :-
         jmp     cmd_version
+
+try_external_command:
+        ;; TEST: Just write "hello" without any command execution
+        lda     #5
+        sta     kCmdOutputBuffer
+        lda     #'h'
+        sta     kCmdOutputBuffer+1
+        lda     #'e'
+        sta     kCmdOutputBuffer+2
+        lda     #'l'
+        sta     kCmdOutputBuffer+3
+        lda     #'l'
+        sta     kCmdOutputBuffer+4
+        lda     #'o'
+        sta     kCmdOutputBuffer+5
+
+        ldax    #kCmdOutputBuffer
+        jsr     AddLineToHistory
+        rts
+
+open_failed:
+        ldax    #msg_open_failed
+        jsr     AddLineToHistory
+        rts
+
+read_failed:
+        ldax    #msg_read_failed
+        jsr     AddLineToHistory
+        rts
+
+external_cmd_error:
+        ldax    #err_load_failed
+        jsr     AddLineToHistory
+        rts
+
+msg_opened: PASCAL_STRING "opened"
+msg_read: PASCAL_STRING "read ok"
+msg_closed: PASCAL_STRING "closed"
+msg_open_failed: PASCAL_STRING "open failed"
+msg_read_failed: PASCAL_STRING "read failed"
+msg_success: PASCAL_STRING "success"
+err_load_failed: PASCAL_STRING "load failed"
 
 done:   rts
 
@@ -1073,35 +1102,6 @@ cmd_version:
         jsr     AddLineToHistory
         rts
 
-;;; --------------------------------------------------
-;;; Execute "pwd" command - print working directory
-
-cmd_pwd:
-        ;; Call GetPrefix in main memory
-        JSR_TO_MAIN GetPrefixMain
-        bcs     pwd_error
-
-        ;; Use AUXMOVE to copy from main to aux
-        ;; AUXMOVE params: STARTLO/HI, ENDLO/HI, DESTINATIONLO/HI
-        copy16  #prefix_buffer_main, STARTLO            ; Source start
-        copy16  #(prefix_buffer_main+65), ENDLO         ; Source end
-        copy16  #prefix_buffer_aux, DESTINATIONLO       ; Dest
-
-        sec                     ; Carry set = main to aux
-        jsr     AUXMOVE
-
-        ;; Now print from aux buffer
-        ldax    #prefix_buffer_aux
-        jsr     AddLineToHistory
-        rts
-
-pwd_error:
-        ldax    #pwd_error_msg
-        jsr     AddLineToHistory
-        rts
-
-pwd_error_msg:
-        PASCAL_STRING "Error reading prefix"
 
 ;;; --------------------------------------------------
 ;;; Execute "cd" command - change directory
@@ -1141,9 +1141,7 @@ cd_done:
         ;; Call SET_PREFIX in main memory
         JSR_TO_MAIN SetPrefixMain
         bcs     cd_error
-
-        ;; Success - optionally show new prefix
-        jmp     cmd_pwd
+        rts
 
 cd_error:
         ldax    #cd_error_msg
@@ -1157,8 +1155,6 @@ cd_path_buffer: .res    65, 0           ; Aux buffer for cd path
 ;;; --------------------------------------------------
 ;;; Data
 
-pwd_cmd:
-        .byte   "PWD"
 version_cmd:
         .byte   "VERSION"
 version_output:
@@ -1238,6 +1234,67 @@ version_output:
         .include "../lib/inttostring.s"
 
 ;;; ============================================================
+;;; External Command Execution
+;;; ============================================================
+
+;;; Helper procs for external command execution
+
+
+;;; ============================================================
+;;; Copy path from aux to main
+
+.proc CopyPathToMain
+        ldy     #43
+:       lda     command_path_aux,y  ; Read from aux (normal)
+        sta     RAMWRTOFF       ; Enable write to main
+        sta     command_path_main,y ; Write to main
+        sta     RAMWRTON        ; Restore write to aux
+        dey
+        bpl     :-
+        rts
+.endproc
+
+;;; ============================================================
+;;; Build Command Path
+;;; Builds path: /A2.DESKTOP/COMMANDS/<commandname>
+;;; Input: input_buffer contains command name
+;;; Output: command_path_aux contains full path
+
+.proc BuildCommandPath
+        COPY_STRING base_command_path, command_path_aux
+        ldy     command_path_aux
+        ldx     #0
+:       inx
+        cpy     #64
+        bcs     done
+        cpx     input_buffer
+        beq     last_char
+        bcs     done
+        iny
+        lda     input_buffer,x
+        cmp     #' '
+        beq     done
+        sta     command_path_aux,y
+        jmp     :-
+last_char:
+        iny
+        lda     input_buffer,x
+        sta     command_path_aux,y
+done:   sty     command_path_aux
+        rts
+
+base_command_path:
+        PASCAL_STRING "/A2.DESKTOP/COMMANDS/"
+.endproc
+
+;;; ============================================================
+;;; Command output interface in aux memory
+;;; ============================================================
+
+kCmdOutputBuffer = $0200        ; Output buffer location
+kCmdOutputCount  = $0300        ; Output line count location
+
+;;; ============================================================
 ;;; RamWorks Detection
 
 .proc DetectRamWorks
@@ -1289,8 +1346,16 @@ copy_str:
 ;;; ============================================================
 ;;; Aux buffers
 
-prefix_buffer_aux:   .res    65, 0      ; Aux copy of prefix for display
-ramworks_banks:      .byte   0          ; Number of RamWorks banks detected (0 = 256)
+prefix_buffer_aux:   .res    45, 0
+ramworks_banks:      .byte   0
+command_path_aux:    .res    44, 0
+
+;;; ============================================================
+;;; MLI parameter blocks in aux memory (keep in sync with main copy!)
+
+        DEFINE_OPEN_PARAMS open_params_aux, command_path_main, DA_IO_BUFFER
+        DEFINE_READWRITE_PARAMS read_params_aux, read_buffer_main, 1024
+        DEFINE_CLOSE_PARAMS close_params_aux
 
 ;;; ============================================================
 
@@ -1300,6 +1365,18 @@ ramworks_banks:      .byte   0          ; Number of RamWorks banks detected (0 =
 
         DA_START_MAIN_SEGMENT
         jmp     Start
+
+;;; ============================================================
+
+        MLIEntry := MLI
+
+;;; ============================================================
+;;; External command constants (repeated for main segment)
+
+kCommandBank    = 2             ; Use bank 2 for external commands
+kCommandStart   = $0800         ; Start address in RamWorks bank
+kCommandEnd     = $BFFF         ; End of usable bank-switched memory
+kMaxCommandSize = kCommandEnd - kCommandStart + 1  ; $B400 = 46,080 bytes
 
 ;;; ============================================================
 
@@ -1321,6 +1398,16 @@ DEFINE_SET_PREFIX_PARAMS setprefix_params_main, cd_path_main
 ;;; Output: C set on error
 .proc GetPrefixMain
         JUMP_TABLE_MLI_CALL GET_PREFIX, getprefix_params_main
+        rts
+.endproc
+
+;;; Test procedure right after GetPrefixMain
+.proc TestOpenFile
+        ;; Just test if OPEN works from here
+        ;; params will be defined later, so just use addresses
+        jsr     JUMP_TABLE_MLI_CALL
+        .byte   OPEN
+        .addr   $0000  ; dummy for now
         rts
 .endproc
 
@@ -1399,6 +1486,169 @@ restore_loop:
         plp                     ; restore interrupt state
         rts
 .endproc ; CheckRamWorksMain
+
+;;; ============================================================
+;;; Load Command File to RamWorks Bank 2
+;;; Input: command_path_aux (in aux memory) contains path
+;;; Output: Carry set on error
+;;; Note: Must be called from main memory
+
+
+;;; ============================================================
+;;; Main segment buffers
+
+command_path_main:      .res    44, 0
+file_ref:               .byte   0
+
+;;; ============================================================
+;;; Load Command File to Main Buffer (main segment)
+
+;;; Parameter blocks and buffers
+bytes_loaded:
+        .word   0
+
+test_hardcoded_path:
+        PASCAL_STRING "/A2.DESKTOP/READ.ME"
+
+DEFINE_OPEN_PARAMS test_open_params, test_hardcoded_path, DA_IO_BUFFER
+DEFINE_READWRITE_PARAMS test_read_params, DA_IO_BUFFER, 1024
+DEFINE_CLOSE_PARAMS test_close_params
+
+;;; Keep in sync with aux copy!
+mli_params_main:
+        DEFINE_OPEN_PARAMS open_params_cmd, command_path_main, DA_IO_BUFFER
+        DEFINE_READWRITE_PARAMS read_params_cmd, read_buffer_main, 1024
+        DEFINE_CLOSE_PARAMS close_params_cmd
+sizeof_mli_params_main = * - mli_params_main
+
+;;; Read buffer in main memory (can't use DA_IO_BUFFER as MLI uses it)
+read_buffer_main := $1700
+        .assert read_buffer_main + 1024 <= DA_IO_BUFFER, error, "buffer overlap"
+
+;; Just OPEN - minimal code
+.proc DoOpenFile
+        jsr     CopyParamsAuxToMain
+        sta     ALTZPOFF        ; Switch to main ZP
+        MLI_CALL OPEN, open_params_cmd
+        sta     ALTZPON         ; Switch back to aux ZP
+        php                     ; Save status
+        lda     open_params_cmd::ref_num  ; Get ref_num
+        tax                     ; Save in X
+        plp                     ; Restore status
+        jsr     CopyParamsMainToAux  ; Preserves A and P
+        txa                     ; Return ref_num in A
+        rts
+.endproc
+
+;; Just READ - minimal code
+.proc DoReadFile
+        ;; Don't call CopyParamsAuxToMain - we already set ref_num in main params
+        sta     ALTZPOFF        ; Switch to main ZP
+        MLI_CALL READ, read_params_cmd
+        php                     ; Save status (includes carry)
+        ;; Read trans_count and store to bytes_loaded while still in main memory mode
+        lda     read_params_cmd::trans_count
+        sta     bytes_loaded
+        lda     read_params_cmd::trans_count+1
+        sta     bytes_loaded+1
+        plp                     ; Restore status (including carry)
+        sta     ALTZPON         ; Switch back to aux ZP (doesn't affect carry)
+        rts
+.endproc
+
+;; Just CLOSE - minimal code
+.proc DoCloseFile
+        jsr     CopyParamsAuxToMain
+        sta     ALTZPOFF        ; Switch to main ZP
+        MLI_CALL CLOSE, close_params_cmd
+        sta     ALTZPON         ; Switch back to aux ZP
+        jmp     CopyParamsMainToAux  ; Preserves A and P, returns
+.endproc
+
+;;; ============================================================
+;;; Copy parameter blocks between aux and main memory
+
+;;; Copies param blocks from Aux to Main
+.proc CopyParamsAuxToMain
+        copy16  #aux::open_params_aux, STARTLO
+        copy16  #aux::close_params_aux + 1, ENDLO  ; end of close_params
+        copy16  #mli_params_main, DESTINATIONLO
+        TAIL_CALL AUXMOVE, C=0  ; aux>main
+.endproc ; CopyParamsAuxToMain
+
+;;; Copies param blocks from Main to Aux
+;;; Preserves A and P
+.proc CopyParamsMainToAux
+        php
+        pha
+
+        copy16  #mli_params_main, STARTLO
+        copy16  #mli_params_main + sizeof_mli_params_main - 1, ENDLO
+        copy16  #aux::open_params_aux, DESTINATIONLO
+        CALL    AUXMOVE, C=1    ; main>aux
+
+        pla
+        plp
+        rts
+.endproc ; CopyParamsMainToAux
+
+;;; ============================================================
+
+;; Read file and execute - called via JSR from DoOpenAndChain
+.proc DoReadAndExecute
+        JUMP_TABLE_MLI_CALL READ, read_params_cmd
+        php             ; Save read status
+
+        ;; Store bytes read
+        lda     read_params_cmd::trans_count
+        sta     bytes_loaded
+        lda     read_params_cmd::trans_count+1
+        sta     bytes_loaded+1
+
+        ;; Close the file
+        JUMP_TABLE_MLI_CALL CLOSE, close_params_cmd
+
+        plp             ; Restore read status
+        bcs     error
+
+        ;; Check we got some bytes
+        lda     bytes_loaded
+        ora     bytes_loaded+1
+        beq     error
+
+        ;; Copy from DA_IO_BUFFER (main) to $0800 (aux)
+        ldx     bytes_loaded
+        lda     bytes_loaded+1
+        bne     cap_256
+        cpx     #0
+        beq     error
+        jmp     do_copy
+cap_256:
+        ldx     #0
+
+do_copy:
+        ldy     #0
+loop:   lda     DA_IO_BUFFER,y
+        sta     RAMWRTOFF
+        sta     kCommandStart,y
+        sta     RAMWRTON
+        iny
+        dex
+        bne     loop
+
+        ;; Execute in aux
+        sta     RAMRDOFF
+        sta     RAMWRTOFF
+        jsr     kCommandStart
+        sta     RAMRDON
+        sta     RAMWRTON
+
+        clc
+        rts
+
+error:  sec
+        rts
+.endproc
 
 ;;; ============================================================
 
