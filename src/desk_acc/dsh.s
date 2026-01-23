@@ -1013,6 +1013,8 @@ temp_len:       .byte   0
         bcs     check_cd
 
         ;; Check exact lengths for other commands
+        cmp     #3
+        beq     check_pwd
         cmp     #7
         beq     check_version
         jmp     try_external_command
@@ -1037,6 +1039,21 @@ check_other:
         cmp     #7
         beq     check_version
         jmp     try_external_command
+
+check_pwd:
+        ;; Check if command is "pwd"
+        lda     input_buffer
+        cmp     #3
+        bne     check_version
+        ldx     #0
+:       lda     input_buffer+1,x
+        jsr     ToUpperCase
+        cmp     pwd_cmd,x
+        bne     check_version
+        inx
+        cpx     #3
+        bne     :-
+        jmp     cmd_pwd
 
 check_version:
         ;; Check if command is "version"
@@ -1093,11 +1110,13 @@ read_ok:
         sta     RAMWRTON
 
         ;; Command wrote output to $0200/$0300 in AUX memory
-        ;; Check line count
+        ;; Check line count (should be 1-10)
         lda     kCmdOutputCount
-        beq     no_output
+        beq     no_output       ; 0 = no output
+        cmp     #11
+        bcs     no_output       ; >= 11 = invalid
 
-        ;; Display the output
+        ;; Display the output (no validation on string length for now)
         ldax    #kCmdOutputBuffer
         jsr     AddLineToHistory
 
@@ -1147,6 +1166,25 @@ cmd_version:
         jsr     AddLineToHistory
         rts
 
+;;; --------------------------------------------------
+;;; Execute "pwd" command - print working directory
+
+cmd_pwd:
+        JSR_TO_MAIN DoGetPrefix
+        bcc     :+
+        ;; Error
+        ldax    #pwd_error_msg
+        jsr     AddLineToHistory
+        rts
+:       ;; Success - the result is in main memory
+        ;; Copy to kCmdOutputBuffer ($0200) in aux which is safe to use
+        JSR_TO_MAIN CopyPrefixResultToAux
+        ldax    #kCmdOutputBuffer
+        jsr     AddLineToHistory
+        rts
+
+pwd_error_msg:
+        PASCAL_STRING "Error reading prefix"
 
 ;;; --------------------------------------------------
 ;;; Execute "cd" command - change directory
@@ -1200,6 +1238,8 @@ cd_path_buffer: .res    65, 0           ; Aux buffer for cd path
 ;;; --------------------------------------------------
 ;;; Data
 
+pwd_cmd:
+        .byte   "PWD"
 version_cmd:
         .byte   "VERSION"
 version_output:
@@ -1614,6 +1654,34 @@ read_buffer_main := $1700
         jmp     CopyParamsMainToAux  ; Preserves A and P, returns
 .endproc
 
+.proc DoGetPrefix
+        sta     ALTZPOFF        ; Switch to main ZP
+        MLI_CALL GET_PREFIX, get_prefix_params
+        php                     ; Save status
+        sta     ALTZPON         ; Switch back to aux ZP
+        plp                     ; Restore status (carry flag)
+        rts
+
+get_prefix_params:
+        .byte   1               ; param_count
+        .addr   pwd_prefix_buffer_main
+
+pwd_prefix_buffer_main: .res 65, 0
+.endproc
+
+.proc CopyPrefixResultToAux
+        ;; Copy from main memory DoGetPrefix::pwd_prefix_buffer_main
+        ;; to aux memory $0200 (kCmdOutputBuffer)
+        ldy     #64
+:       lda     DoGetPrefix::pwd_prefix_buffer_main,y
+        sta     RAMWRTON
+        sta     $0200,y
+        sta     RAMWRTOFF
+        dey
+        bpl     :-
+        rts
+.endproc
+
 ;;; ============================================================
 ;;; Copy parameter blocks between aux and main memory
 
@@ -1722,12 +1790,35 @@ done:   rts
 
 .proc ExecuteCommandInMainMemory
         ;; Command is now at $0800 in main memory (its expected location)
-        ;; Set up: write to aux (for output buffer), but read from main
+        ;; Set up for MLI compatibility: main ZP, main memory
+        sta     ALTZPOFF        ; Use main ZP (required for MLI)
         sta     RAMRDOFF        ; Read from main
-        sta     RAMWRTON        ; Write to aux
+        sta     RAMWRTOFF       ; Write to main (MLI needs this)
 
         ;; Call command at $0800
+        ;; Command will write output to $0200 in MAIN memory
         jsr     $0800
+
+        ;; Copy output from main $0200 to aux $0200
+        ldy     $0200           ; Get string length from main
+        beq     copy_count      ; Skip if empty
+copy_loop:
+        lda     $0200,y         ; Copy from main
+        sta     RAMWRTON        ; Switch to aux write
+        sta     $0200,y         ; Write to aux
+        sta     RAMWRTOFF       ; Back to main write
+        dey
+        bpl     copy_loop
+
+copy_count:
+        ;; Copy line count
+        lda     $0300           ; Read from main
+        sta     RAMWRTON        ; Switch to aux write
+        sta     $0300           ; Write to aux
+        sta     RAMWRTOFF       ; Back to main write
+
+        ;; Restore aux ZP
+        sta     ALTZPON
 
         ;; DON'T restore memory here - caller will do it
         rts
