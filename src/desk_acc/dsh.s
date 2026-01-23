@@ -1051,22 +1051,57 @@ check_version:
         jmp     cmd_version
 
 try_external_command:
-        ;; TEST: Just write "hello" without any command execution
-        lda     #5
-        sta     kCmdOutputBuffer
-        lda     #'h'
-        sta     kCmdOutputBuffer+1
-        lda     #'e'
-        sta     kCmdOutputBuffer+2
-        lda     #'l'
-        sta     kCmdOutputBuffer+3
-        lda     #'l'
-        sta     kCmdOutputBuffer+4
-        lda     #'o'
-        sta     kCmdOutputBuffer+5
+        ;; Build command path: /A2.DESKTOP/COMMANDS/<command>
+        jsr     BuildCommandPath
+        jsr     CopyPathToMain
 
+        ;; Open command file
+        JSR_TO_MAIN DoOpenFile
+        bcc     open_ok
+        jmp     open_failed
+
+open_ok:
+        ;; Store ref_num (returned in A)
+        sta     read_params_aux + 1
+        sta     close_params_aux + 1
+
+        ;; Also store in main params
+        sta     RAMRDOFF
+        sta     RAMWRTOFF
+        sta     read_params_cmd + 1
+        sta     close_params_cmd + 1
+        sta     RAMRDON
+        sta     RAMWRTON
+
+        ;; Read command file to buffer in main memory
+        JSR_TO_MAIN DoReadFile
+        bcc     read_ok
+        jmp     read_failed
+
+read_ok:
+        ;; Close the file (we're done with it)
+        JSR_TO_MAIN DoCloseFile
+
+        ;; Copy command from $1700 to $0800 in main memory
+        JSR_TO_MAIN CopyCommandTo0800
+
+        ;; Execute command at $0800 in main memory
+        JSR_TO_MAIN ExecuteCommandInMainMemory
+
+        ;; Restore aux memory
+        sta     RAMRDON
+        sta     RAMWRTON
+
+        ;; Command wrote output to $0200/$0300 in AUX memory
+        ;; Check line count
+        lda     kCmdOutputCount
+        beq     no_output
+
+        ;; Display the output
         ldax    #kCmdOutputBuffer
         jsr     AddLineToHistory
+
+no_output:
         rts
 
 open_failed:
@@ -1093,6 +1128,16 @@ msg_success: PASCAL_STRING "success"
 err_load_failed: PASCAL_STRING "load failed"
 
 done:   rts
+
+;;; ============================================================
+;;; Trampoline to execute command in current RamWorks bank
+;;;
+;;; Called from main memory with bank already switched
+;;; This code runs in AUX bank 0, jumps to $0800 in whatever
+;;; bank is currently selected
+;;; ============================================================
+
+;;; NO LONGER NEEDED - removed bank switching approach
 
 ;;; --------------------------------------------------
 ;;; Execute "version" command
@@ -1378,6 +1423,10 @@ kCommandStart   = $0800         ; Start address in RamWorks bank
 kCommandEnd     = $BFFF         ; End of usable bank-switched memory
 kMaxCommandSize = kCommandEnd - kCommandStart + 1  ; $B400 = 46,080 bytes
 
+;;; Command output interface (same addresses as in aux segment)
+kCmdOutputBuffer = $0200        ; Output buffer location
+kCmdOutputCount  = $0300        ; Output line count location
+
 ;;; ============================================================
 
 .proc Start
@@ -1647,6 +1696,165 @@ loop:   lda     DA_IO_BUFFER,y
         rts
 
 error:  sec
+        rts
+.endproc
+
+;;; ============================================================
+;;; RamWorks Trampoline - Execute Command in Bank 2
+;;;
+;;; This code runs in MAIN memory and is not affected by RamWorks
+;;; bank switching. It switches to bank 2, executes the command,
+;;; and switches back to bank 0.
+;;;
+;;; Called from aux memory via JSR_TO_MAIN
+;;; ============================================================
+
+.proc CopyCommandTo0800
+        ;; Copy from $1700 to $0800 in main memory
+        ldy     bytes_loaded
+        beq     done
+:       lda     read_buffer_main-1,y
+        sta     $0800-1,y
+        dey
+        bne     :-
+done:   rts
+.endproc
+
+.proc ExecuteCommandInMainMemory
+        ;; Command is now at $0800 in main memory (its expected location)
+        ;; Set up: write to aux (for output buffer), but read from main
+        sta     RAMRDOFF        ; Read from main
+        sta     RAMWRTON        ; Write to aux
+
+        ;; Call command at $0800
+        jsr     $0800
+
+        ;; DON'T restore memory here - caller will do it
+        rts
+.endproc
+
+;;; ============================================================
+;;; Copy Command to Bank 2
+;;;
+;;; Copies command from read_buffer_main to bank 2 aux $0800
+;;; Input: bytes_loaded = number of bytes to copy
+;;; ============================================================
+
+.proc CopyCommandToBank2
+        ;; Get byte count
+        lda     bytes_loaded
+        sta     copy_count
+        lda     bytes_loaded+1
+        sta     copy_count+1
+
+        ;; Check for zero bytes
+        ora     copy_count
+        beq     done
+
+        ;; Switch to RamWorks bank 2
+        lda     #kCommandBank
+        sta     RAMWORKS_BANK
+
+        ;; Set up memory: read main, write aux
+        sta     RAMRDOFF
+        sta     RAMWRTON
+
+        ;; Copy first page (up to 256 bytes)
+        ldy     #0
+        ldx     copy_count      ; Low byte of count
+        beq     check_high      ; If low byte is 0, only copy high byte pages
+
+copy_first:
+        lda     read_buffer_main,y
+        sta     kCommandStart,y
+        iny
+        dex
+        bne     copy_first
+
+check_high:
+        ;; Check if we have more pages to copy
+        dec     copy_count+1
+        bmi     copy_done       ; If high byte was 0, we're done
+
+        ;; Copy additional 256-byte pages
+        ldx     copy_count+1    ; Number of additional pages
+copy_page:
+        lda     read_buffer_main,y
+        sta     kCommandStart,y
+        iny
+        bne     copy_page
+        dex
+        bne     copy_page
+
+copy_done:
+        ;; Switch back to bank 0
+        lda     #0
+        sta     RAMWORKS_BANK
+
+        ;; DON'T restore aux memory yet - we're still executing in main!
+        ;; The caller (aux code) will restore memory state after return
+
+done:   rts
+
+copy_count:
+        .word   0
+.endproc
+
+;;; ============================================================
+;;; Read Output from Bank 2
+;;;
+;;; Reads command output from bank 2 and copies to bank 0
+;;; Output: A = line count (0 if no output)
+;;; ============================================================
+
+.proc ReadOutputFromBank2
+        ;; Switch to RamWorks bank 2
+        lda     #kCommandBank
+        sta     RAMWORKS_BANK
+
+        ;; Set up memory: read aux, write aux
+        sta     RAMRDON
+        sta     RAMWRTON
+
+        ;; Read line count from $0300 in bank 2
+        lda     kCmdOutputCount
+        pha                     ; Save for return value
+
+        ;; Check if there's output to copy
+        beq     no_output
+
+        ;; Copy output buffer from bank 2 to bank 0
+        ;; We'll copy up to 256 bytes (plenty for output buffer)
+        ldy     #0
+copy_loop:
+        lda     kCmdOutputBuffer,y
+        pha                     ; Save byte
+
+        ;; Switch to bank 0 to write
+        lda     #0
+        sta     RAMWORKS_BANK
+
+        pla                     ; Restore byte
+        sta     kCmdOutputBuffer,y
+
+        ;; Switch back to bank 2 to read next byte
+        lda     #kCommandBank
+        sta     RAMWORKS_BANK
+
+        iny
+        cpy     #$FF            ; Copy up to 255 bytes
+        bne     copy_loop
+
+no_output:
+        ;; Switch back to bank 0
+        lda     #0
+        sta     RAMWORKS_BANK
+
+        ;; Restore read/write to aux
+        sta     RAMRDON
+        sta     RAMWRTON
+
+        pla                     ; Return line count in A
         rts
 .endproc
 
